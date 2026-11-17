@@ -4,141 +4,155 @@
 
 Introduce a lightweight, fully typed Python SDK that lets applications retrieve configuration variables from Yily and use them directly in Python code: scripts, web services (FastAPI, Django, Flask), workers and CI jobs.
 
-The SDK follows Yily's philosophy — **simple and effective** — and stays aligned with the accepted [Go SDK proposal](go.md): same scope, same endpoints, same error semantics, adapted to Python conventions.
+The SDK follows Yily's philosophy — **simple and effective** — and uses the existing SDKs as its behavioral references:
+
+- [`yily-sdk-go`](https://github.com/yannick2009/yily-sdk-go)
+- [`yily-sdk-js`](https://github.com/yannick2009/yily-sdk-js)
+
+The proposal is split in two parts:
+
+- **The core** (sections 2 to 10) reproduces the behavior of the Go and JS/TS SDKs exactly, with Python naming.
+- **Python-specific additions** (section 11) are optional ideas, presented separately so they can be discussed, adjusted or dropped without affecting the core.
 
 ## 2. Scope
 
-The SDK supports:
+The SDK is **read-only**. It supports:
 
 - Connecting to a Yily instance and selecting an environment.
-- Authenticating with a pre-provisioned Personal Access Token (PAT).
-- Retrieving every variable of an environment.
-- Retrieving individual variables by name, optionally at a specific version.
-- Loading values into a typed configuration object (dataclass or Pydantic model), with automatic type conversion.
-- Optionally exporting values into `os.environ` for libraries that only read environment variables.
-- Synchronous **and** asynchronous usage with the same API.
+- Authenticating with a pre-provisioned, read-scoped Personal Access Token (PAT).
+- Retrieving one variable's active value (`get`).
+- Retrieving one variable at a specific version (`get_version`).
+- Retrieving every active variable of the environment (`get_all`).
+- Loading variables into a typed structure (`load`).
+- Batch retrieval through the existing values endpoint.
 
-Out of scope for the first release, as in the Go SDK: project, environment, tag and token administration. Token creation remains session-only on the server and is never exposed through a PAT.
+Out of scope: creating, updating or deleting variables, and any project, environment, tag or token management. PATs are created and managed in the Yily web interface.
 
-Write operations (creating variables, adding versions) are discussed as an optional second phase in [section 10](#10-managing-secrets-phase-2), so the first release can ship as a small read-only package.
+## 3. Alignment with the Existing SDKs
 
-## 3. Project Structure
+| Behavior | Go | JS/TS | Python (proposed) |
+|---|---|---|---|
+| Active value | `Get(ctx, name)` | `get(name)` | `get(name)` |
+| Specific version | `GetVersion(ctx, name, v)` | `getVersion(name, v)` | `get_version(name, version)` |
+| All active values | `GetAll(ctx)` | `getAll()` | `get_all()` |
+| Typed loading | `Load(ctx, &struct)` + `yily` tags | `load(schema)` | `load(DataclassType)` + `yily.Var` |
+| Default timeout | 5 s | 5000 ms | 5.0 s |
+| Custom transport | `HTTPClient` | `fetch` | `http_client` (`httpx.Client`) |
+| Cancellation | `context.Context` | `AbortSignal` | per-call `timeout`; task cancellation in async (section 11) |
+| Errors | sentinel errors + `*APIError` | `YilyError` with `code` + `APIError` | `YilyError` with `code` + `APIError` |
 
-Like the Go SDK, the Python SDK lives in a dedicated repository: `github.com/yannick2009/yily-sdk-python`.
+Every rule described in sections 6 to 9 (validation, name normalization, deduplication, missing variables, conversion grammar, error codes) mirrors the Go and JS implementations, so the three SDKs behave the same against the same server.
+
+## 4. Project Structure
+
+Like the other SDKs, the Python SDK lives in a dedicated repository: `github.com/yannick2009/yily-sdk-python`.
 
 ```text
 .
 ├── pyproject.toml
 ├── README.md
 ├── CHANGELOG.md
+├── LICENSE
 ├── src/
 │   └── yily/
-│       ├── __init__.py        # Public exports
-│       ├── py.typed           # PEP 561 marker: the package ships type hints
-│       ├── _config.py         # Config object, validation and from_env()
-│       ├── _client.py         # Client (synchronous)
-│       ├── _async_client.py   # AsyncClient (asynchronous)
-│       ├── _http.py           # Shared request building, envelope parsing, retries
-│       ├── _loader.py         # Typed loading into dataclasses / Pydantic models
-│       ├── _convert.py        # String → Python type conversion
-│       ├── _secret.py         # Secret wrapper that masks values in repr/logs
-│       └── errors.py          # Exception hierarchy
+│       ├── __init__.py      # Public exports
+│       ├── py.typed         # PEP 561 marker: the package ships type hints
+│       ├── _config.py       # Config validation and base URL normalization
+│       ├── _client.py       # Client: get, get_version, get_all, load
+│       ├── _http.py         # Request building, envelope parsing, error mapping
+│       ├── _loader.py       # Dataclass inspection and field mapping
+│       ├── _convert.py      # String → Python type conversion, duration parser
+│       ├── _utils.py        # Variable name normalization
+│       └── errors.py        # YilyError, APIError, YilyErrorCode
 ├── tests/
-│   ├── unit/
-│   └── integration/
 └── examples/
-    ├── basic.py
-    ├── dataclass_config.py
-    ├── fastapi_app.py
-    └── django_settings.py
 ```
 
-The distribution is published on PyPI as `yily` (or `yily-sdk` if the name is taken) and imported as `import yily`. Every module except `errors` is private (underscore prefix); the public surface is what `yily/__init__.py` re-exports.
+Modules prefixed with `_` are private. The public surface is what `yily/__init__.py` re-exports: `Client`, `Var`, `YilyError`, `APIError` and `YilyErrorCode`.
 
-## 4. Public API
+## 5. Public API
 
-| Symbol | Purpose |
-|---|---|
-| `yily.Client(...)` | Synchronous client. Usable as a context manager. |
-| `yily.AsyncClient(...)` | Asynchronous client with the same methods, as coroutines. |
-| `client.get(name, *, version=None) -> str` | Value of one variable (active version by default). |
-| `client.get_many(selection) -> dict[str, str]` | Several variables in one request; `selection` is a list of names or a `{name: version}` mapping. |
-| `client.get_all() -> dict[str, str]` | Every variable of the environment with its active value. |
-| `client.load(model) -> model` | Builds a typed configuration object from a dataclass or Pydantic model. |
-| `client.export_to_environ(*, overwrite=False) -> list[str]` | Copies values into `os.environ`; returns the names that were set. |
-| `client.token_info() -> TokenInfo` | Metadata of the current PAT (name, scope, expiry), via `GET /tokens/me`. |
-| `yily.Var(name, *, version=None)` | Field annotation used by `load()` to map a field to a variable and version. |
-| `yily.Secret` | String wrapper whose `repr()`/`str()` are masked; `.reveal()` returns the value. |
+```python
+class Client:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        environment_id: str,
+        token: str,
+        timeout: float = 5.0,
+        http_client: httpx.Client | None = None,
+    ) -> None: ...
+
+    def get(self, name: str) -> str: ...
+    def get_version(self, name: str, version: int) -> str: ...
+    def get_all(self) -> dict[str, str]: ...
+    def load(self, target: type[T]) -> T: ...
+
+    def close(self) -> None: ...
+    def __enter__(self) -> Self: ...
+    def __exit__(self, *exc_info: object) -> None: ...
+```
 
 Minimal example:
 
 ```python
+import os
 import yily
 
 with yily.Client(
     base_url="https://yily.example.com",
-    environment_id="ENVx9boixbYI9by",
-    token="yily_...",
+    environment_id="ENVxxxxxxxxxxxx",
+    token=os.environ["YILY_TOKEN"],
 ) as client:
-    db_host = client.get("DB_HOST")
-    old_key = client.get("API_KEY", version=2)
-    everything = client.get_all()
+    api_key = client.get("API_KEY")
+    legacy_key = client.get_version("API_KEY", 1)
+    all_vars = client.get_all()
 ```
 
-## 5. Authentication and Configuration
+A `Client` is immutable after construction and safe to share across threads, as in Go and JS. The context manager only closes the underlying HTTP connection pool. When `http_client` is provided, the SDK never closes it: its owner does.
 
-### 5.1. Personal Access Tokens
+## 6. Configuration and Authentication
 
-The SDK authenticates every request with:
+### 6.1. Validation
+
+The constructor validates its arguments eagerly and raises `YilyError` with the same codes as the JS SDK:
+
+| Rule | Error code |
+|---|---|
+| `base_url` empty | `MISSING_BASE_URL` |
+| `base_url` not an absolute `http`/`https` URL, or containing credentials, a query string or a fragment | `INVALID_BASE_URL` |
+| `token` empty | `MISSING_TOKEN` |
+| `token` not starting with `yily_`, or equal to `yily_` | `INVALID_TOKEN` |
+| `environment_id` empty | `MISSING_ENVIRONMENT_ID` |
+| `timeout` not a finite number | `INVALID_TIMEOUT` |
+
+Surrounding whitespace is trimmed from every value. A zero or negative `timeout` selects the 5-second default, as in the other SDKs. The environment ID is treated as an opaque string and URL-encoded in request paths.
+
+### 6.2. Base URL normalization
+
+Trailing slashes are removed, one trailing `/api/v1` suffix is dropped, and exactly one `/api/v1` is appended. `https://yily.example.com`, `https://yily.example.com/` and `https://yily.example.com/api/v1` are therefore equivalent.
+
+### 6.3. Authentication
+
+Every request carries:
 
 ```http
 Authorization: Bearer yily_<token>
+Accept: application/json
 ```
 
-PATs are created in the web interface, which is the only place where tokens can be managed. The recommended scope for applications is **read**. `token_info()` lets an application check the scope and expiry of its token, for example in a health check, without the SDK making that extra request on every startup.
+A read-scoped PAT is recommended for applications. The token is never logged, never included in error messages and excluded from `repr(client)`.
 
-The token is never logged, never included in exception messages and is excluded from `repr(client)` / `repr(config)`.
+## 7. Retrieving Variables
 
-### 5.2. Configuration
+### 7.1. Batch endpoint
 
-```python
-client = yily.Client(
-    base_url="https://yily.example.com",  # required, http(s) only
-    environment_id="ENVx9boixbYI9by",      # required, validated format (ENV + 12 base62 chars)
-    token="yily_...",                      # required
-    timeout=5.0,                           # seconds, default 5 (same as Go SDK)
-    max_retries=2,                         # retries for transient failures, default 2
-    verify=True,                           # TLS verification, or path to a CA bundle
-    http_client=None,                      # optional pre-configured httpx.Client / AsyncClient
-)
-```
-
-Validation happens in the constructor and raises `yily.ConfigurationError` immediately (bad URL scheme, empty token, malformed environment ID). Trailing slashes and `/api/v1` suffixes in `base_url` are normalized.
-
-Unlike the Go SDK, which leaves environment loading to the caller, Python users commonly configure services through environment variables, so the SDK offers an **explicit** opt-in constructor:
-
-```python
-client = yily.Client.from_env()  # reads YILY_URL, YILY_TOKEN, YILY_ENVIRONMENT_ID
-```
-
-Nothing is read from the environment unless `from_env()` is called. Keyword arguments passed to `from_env()` override environment values.
-
-### 5.3. Transport security
-
-A warning is emitted when `base_url` uses plain `http://` with a host other than `localhost`/`127.0.0.1`, since PATs and secret values would travel unencrypted.
-
-Redirects are **not followed** by default (`follow_redirects=False` in `httpx`). A Yily API never needs to redirect a client, and following a redirect could send the `Authorization` header to another host — for example after a misconfigured reverse proxy redirects `http://` to a different domain. A `3xx` response raises an `APIError` whose message includes the `Location` target, so the user can fix `base_url` instead of silently leaking the token.
-
-## 6. Retrieving Secrets
-
-### 6.1. Batch endpoint
-
-`get`, `get_many` and `load` use the read-only batch endpoint already used by the Go SDK:
+`get`, `get_version` and `load` use the read-only batch endpoint, like the Go and JS SDKs:
 
 ```http
 POST /api/v1/environments/{environmentID}/variables/values
 Content-Type: application/json
-Authorization: Bearer yily_<token>
 
 {
   "variables": [
@@ -148,8 +162,6 @@ Authorization: Bearer yily_<token>
 }
 ```
 
-Response (standard Yily envelope):
-
 ```json
 {
   "status": 200,
@@ -158,32 +170,38 @@ Response (standard Yily envelope):
 }
 ```
 
-SDK behavior, matching the server contract:
+`get` and `get_version` send a batch containing one variable. `load` sends one batch for every mapped field.
 
-- An omitted version selects the active version.
-- A requested name absent from `data` raises `yily.VariableNotFoundError` (with the name, never a value).
-- A variable without an active version is returned as an empty string.
-- The server accepts 1 to 1,000 selections per request; the SDK transparently splits larger selections into several requests.
-- Duplicate names with different versions in one call raise `yily.ConflictingVersionError` locally, before any request is sent.
+### 7.2. Selection rules
 
-### 6.2. Listing every variable
+Before a request is sent, the SDK applies the same rules as the Go and JS SDKs:
 
-`get_all()` first lists the environment with `GET /api/v1/environments/{environmentID}/variables`, then fetches every value through the batch endpoint — the same two-step strategy as the Go SDK.
+1. **Name normalization**: names are upper-cased and each run of whitespace becomes one underscore (`"db host"` → `DB_HOST`), matching the server's convention.
+2. **Empty names**: `get` and `get_version` raise `INVALID_VARIABLE_NAME` when the normalized name is empty.
+3. **Versions**: `get_version` raises `INVALID_VERSION` when `version` is not a positive integer. An omitted version selects the active version.
+4. **Deduplication**: identical selections are sent once. The same variable requested at two different versions raises `CONFLICTING_VARIABLE_VERSION`.
 
-### 6.3. Synchronous and asynchronous clients
+### 7.3. Results
 
-Both clients share the same request-building, parsing and error-mapping code in `_http.py`; only the I/O layer differs. This keeps the two APIs strictly identical:
+- A requested name absent from `data` raises `VARIABLE_NOT_FOUND`.
+- A variable without an active version is returned as an empty string, which is a valid value.
+- A malformed response (non-object envelope, non-string values) raises `DECODE_FAILED`.
+- Keys are copied into a plain `dict`, so server-provided names cannot affect anything other than the returned mapping.
 
-```python
-async with yily.AsyncClient.from_env() as client:
-    values = await client.get_many(["DB_HOST", "DB_PORT"])
-```
+### 7.4. `get_all`
 
-## 7. Loading Typed Configuration
+`get_all()` performs two requests, like the Go and JS SDKs:
 
-### 7.1. Declaring a configuration
+1. `GET /api/v1/environments/{environmentID}/variables` to list variable names.
+2. One batch request for their active values.
 
-`load()` accepts a **dataclass** (standard library, no extra dependency) or a **Pydantic v2 model** (when Pydantic is installed). Variable names default to the field name in upper case; `yily.Var` overrides the name and/or selects a version through `typing.Annotated`:
+An empty environment returns `{}` after the first request, without a second one. Because there are two requests, the result is not an atomic snapshot: a variable created or deleted in between may be missing or absent.
+
+## 8. Typed Loading
+
+### 8.1. Declaring the structure
+
+The Go SDK maps struct fields with `yily` tags; the JS SDK uses a schema object. The idiomatic Python equivalent is a **dataclass** whose fields are mapped with `typing.Annotated` and `yily.Var`:
 
 ```python
 from dataclasses import dataclass
@@ -195,224 +213,227 @@ import yily
 
 @dataclass(frozen=True)
 class AppConfig:
-    db_host: str                                        # → DB_HOST, active version
-    db_port: int                                        # → DB_PORT, converted to int
-    jwt_secret: Annotated[yily.Secret, yily.Var("JWT_SECRET")]
+    db_host: Annotated[str, yily.Var("DB_HOST")]
+    db_port: Annotated[int, yily.Var("DB_PORT")]
+    debug: Annotated[bool, yily.Var("DEBUG")]
+    timeout: Annotated[timedelta, yily.Var("TIMEOUT")]
     legacy_key: Annotated[str, yily.Var("API_KEY", version=2)]
-    debug: bool = False                                 # → DEBUG, default used if missing
-    sentry_dsn: str | None = None                       # optional: None if missing
 
 
 config = client.load(AppConfig)
 ```
 
-### 7.2. Loading rules
+Mapping rules, aligned with the Go tags and JS schema:
 
-The loader:
+- Only fields annotated with `yily.Var` are loaded. Other fields are ignored, as untagged Go fields are. They must have a default value, since `load` builds the instance.
+- `yily.Var(name, version=N)` selects a specific version; `version` must be a positive integer, otherwise `INVALID_FIELD` is raised.
+- Two fields mapping the same variable with different versions raise `CONFLICTING_VARIABLE_VERSION`.
+- `load` accepts a dataclass **type** and returns a new instance, as the JS SDK returns a new object. Passing anything else raises `INVALID_FIELD`.
 
-1. Inspects the fields and their type hints.
-2. Collects variable names and versions.
-3. Retrieves every value in **one** batch request (split only above 1,000 variables).
-4. Converts each value to the annotated type.
-5. Builds the object only if every conversion succeeds; otherwise raises a single `yily.LoadError` listing every failing field.
+### 8.2. Loading pipeline
 
-Missing variables:
+1. Inspect the dataclass and collect the mapped fields.
+2. Retrieve every value in one batch request.
+3. Check that every variable is present; otherwise raise `VARIABLE_NOT_FOUND` naming the variable.
+4. Convert every value.
+5. Build the instance only if every step succeeded. A failure never returns a partially loaded object.
 
-- A field with a default value (or typed `X | None`) uses its default.
-- A required field raises `yily.LoadError` listing the missing variable names.
+### 8.3. Supported types and conversion grammar
 
-Mapping the same variable to two fields with different versions raises `yily.ConflictingVersionError`, mirroring `ErrConflictingVariableVersion` in Go.
+The SDK follows the JS SDK's conversion grammar, which reproduces Go's `strconv` and `time.ParseDuration` rules (Go additionally accepts hexadecimal floats, which neither the JS nor the Python SDK supports). Python's built-in `int()` and `float()` are more permissive (they accept surrounding whitespace and `1_000`), so the SDK validates the input against the same patterns as the JS SDK before converting it.
 
-### 7.3. Supported types
+| Go type | JS type | Python annotation | Accepted values |
+|---|---|---|---|
+| `string` | `string` | `str` | any value, including empty |
+| `int`, `int64` | `int`, `int64` | `int` | optional sign followed by digits (`^[+-]?\d+$`), within the signed 64-bit range |
+| `float64` | `float64` | `float` | decimal and exponent notation, plus `nan`, `inf`, `infinity` with an optional sign (case-insensitive) |
+| `bool` | `bool` | `bool` | `1`, `t`, `T`, `TRUE`, `true`, `True` / `0`, `f`, `F`, `FALSE`, `false`, `False` |
+| `time.Duration` | `duration` | `datetime.timedelta` | Go duration syntax: `0`, `5s`, `250ms`, `1h30m`, `1.5h`, units `ns`, `us`, `µs`, `ms`, `s`, `m`, `h` |
 
-| Annotation | Conversion |
-|---|---|
-| `str` | as is |
-| `int`, `float`, `decimal.Decimal` | standard constructors |
-| `bool` | `true/false`, `1/0`, `yes/no`, `on/off` (case-insensitive); anything else is an error |
-| `datetime.timedelta` | Go-style durations (`30s`, `5m`, `1h30m`), for parity with `time.Duration` |
-| `pathlib.Path` | `Path(value)` |
-| `list[T]` | comma-separated values, each converted to `T` |
-| `yily.Secret` | wrapped, masked in `repr()` |
-| `X \| None` | optional field |
+Python has a single integer type, so Go's `int` and `int64` both map to `int`. The 64-bit range check keeps behavior identical to Go and JS.
 
-With Pydantic models, the SDK passes raw strings to `model_validate()` and lets Pydantic perform conversion and validation, so users keep all Pydantic features (`SecretStr`, validators, constraints).
+An invalid value raises `INVALID_VALUE`; an annotation outside this table raises `UNSUPPORTED_TYPE`. Messages name the variable and the expected type, **never the value**.
 
-Conversion errors include the variable name and the target type, **never the value**.
+## 9. Error Handling
 
-### 7.4. Exporting to `os.environ`
+### 9.1. Error classes
 
-Many libraries only read `os.environ`. For them:
+The Python SDK follows the JS SDK model: one base exception carrying a stable code, and a subclass for API responses.
 
 ```python
-client.export_to_environ()                     # fills missing keys only
-client.export_to_environ(overwrite=True)       # replaces existing keys
+class YilyError(Exception):
+    code: YilyErrorCode          # stable, machine-readable SDK code
+
+class APIError(YilyError):
+    status_code: int             # HTTP status of the response
+    api_code: str | None         # server's `code` field, when present
 ```
 
-## 8. Error Handling
+`YilyErrorCode` is a `StrEnum` whose values are **identical** to the JS SDK codes:
 
-### 8.1. Exception hierarchy
+| Group | Codes |
+|---|---|
+| Configuration | `MISSING_BASE_URL`, `INVALID_BASE_URL`, `MISSING_TOKEN`, `INVALID_TOKEN`, `MISSING_ENVIRONMENT_ID`, `INVALID_TIMEOUT` |
+| Loading and selection | `INVALID_FIELD`, `INVALID_VARIABLE_NAME`, `INVALID_VERSION`, `CONFLICTING_VARIABLE_VERSION`, `UNSUPPORTED_TYPE`, `INVALID_VALUE`, `VARIABLE_NOT_FOUND` |
+| Transport and API | `REQUEST_FAILED`, `ENCODE_FAILED`, `DECODE_FAILED`, `API_ERROR`, `UNAUTHORIZED`, `NOT_FOUND` |
 
-```text
-YilyError                          # base class for everything raised by the SDK
-├── ConfigurationError             # invalid client configuration
-├── ConflictingVersionError        # same variable requested at two versions
-├── LoadError                      # load() failed (missing variables, conversions)
-│   └── ConversionError            # one value could not be converted
-├── TransportError                 # network failure, DNS, TLS
-│   └── TimeoutError
-└── APIError                       # non-2xx response; exposes .status, .code, .message
-    ├── AuthenticationError        # 401: invalid, expired or revoked token
-    ├── PermissionDeniedError      # 403: e.g. TOKEN_WRITE_FORBIDDEN
-    ├── NotFoundError              # 404
-    │   ├── EnvironmentNotFoundError
-    │   ├── VariableNotFoundError       # also raised for names missing from a batch response
-    │   └── VariableVersionNotFoundError
-    ├── BadRequestError            # 400: VALIDATION_FAILED, VARIABLE_SELECTION_DUPLICATE, …
-    ├── RateLimitError             # 429
-    └── ServerError                # 5xx
-```
+The JS-only `INVALID_FETCH` code has no Python equivalent, since `http_client` is type-checked.
 
-### 8.2. Mapping server responses
+### 9.2. Mapping API responses
 
-Every API error carries the server's stable `code` (e.g. `VARIABLE_NOT_FOUND`, `TOKEN_EXPIRED`, `ENVIRONMENT_NOT_FOUND`). The SDK maps the code to the most specific exception first, then falls back to the HTTP status: some responses, such as the authentication middleware's 401, do not include a code. Unknown codes produce the generic class for their status, so new server codes never break existing clients.
+As in the Go and JS SDKs:
+
+- Any non-2xx response raises `APIError` with `status_code` and, when the body is a Yily envelope, the server's `code` as `api_code` (for example `VARIABLE_VERSION_NOT_FOUND` or `ENVIRONMENT_NOT_FOUND`).
+- `code` is `UNAUTHORIZED` for HTTP 401, `NOT_FOUND` for HTTP 404, and `API_ERROR` otherwise.
+- When the body is not a valid envelope, the error falls back to the HTTP status and reason phrase.
+- Network failures and timeouts raise `YilyError` with `REQUEST_FAILED`, chaining the original `httpx` exception through `__cause__`.
 
 ```python
 try:
-    config = client.load(AppConfig)
-except yily.AuthenticationError:
-    sys.exit("Yily token is invalid, expired or revoked")
-except yily.LoadError as exc:
-    sys.exit(f"Missing or invalid configuration: {exc.fields}")
-except yily.YilyError as exc:
-    sys.exit(f"Could not reach Yily: {exc}")
+    api_key = client.get("API_KEY")
+except yily.APIError as error:
+    log.error("Yily API error %s (%s)", error.status_code, error.api_code)
+except yily.YilyError as error:
+    if error.code is yily.YilyErrorCode.VARIABLE_NOT_FOUND:
+        ...
+    raise
 ```
 
-### 8.3. Retries and timeouts
+## 10. HTTP and Security
 
-- Default timeout: 5 seconds per request.
-- Retries (`max_retries`, default 2) with exponential backoff and jitter, only for connection errors, timeouts, `429`, `502`, `503` and `504`. All read operations, including the batch `POST`, are non-mutating and therefore safe to retry. A `Retry-After` header is honored when present.
-- `401`, `403`, `404` and `400` are never retried.
+- **Transport**: [`httpx`](https://www.python-httpx.org/), the only runtime dependency, with a 5-second default timeout and connection pooling.
+- **No automatic retries**: neither the Go nor the JS SDK retries, so the core does not either.
+- **HTTPS**: required outside local development, so PATs and values are protected in transit.
+- **Redirects are not followed**, which is the `httpx` default. A Yily API never needs to redirect a client, and following a redirect after a misconfigured reverse proxy could send the request to another host. A `3xx` response raises an `APIError` that names the `Location` target, so the user can fix `base_url`.
+- **No logging of secrets**: the SDK returns values to the caller and never logs, caches or persists them. It does not log anything by default.
+- **Token revocation**: a password recovery on the server revokes every PAT. Applications then receive `UNAUTHORIZED` and need a new token.
 
-## 9. Security
+## 11. Python-specific Additions (for discussion)
 
-- Secret values are returned to the caller and never logged, cached on disk or included in exceptions.
-- `yily.Secret` is available for fields that should not leak through `repr()`, `print()` or framework debug pages.
-- The SDK does not log at all by default. It uses the standard `logging` module under the `yily` logger, at `DEBUG` level, for request method, path, status and duration only — never headers, bodies or values.
-- TLS verification is enabled by default and can only be relaxed explicitly (`verify=False` or a custom CA bundle).
-- Redirects are never followed, so the PAT cannot be forwarded to another host (see [5.3](#53-transport-security)).
-- Expired or revoked tokens (`TOKEN_EXPIRED`, `TOKEN_REVOKED`) raise `AuthenticationError` immediately and are never retried. A password recovery on the server revokes every PAT, so applications must be ready to receive this error.
-- No in-memory cache is kept in the first release, so a rotated secret is visible on the next read. A time-based cache can be added later if users ask for it.
+The following ideas do not exist in the Go or JS SDKs. Each one is independent, builds on the core without changing its behavior, and can be accepted, postponed or dropped.
 
-## 10. Managing Secrets (phase 2)
+| Addition | Why it fits Python | Effect on the core |
+|---|---|---|
+| `AsyncClient` | FastAPI, Starlette and async workers are common. `httpx` provides sync and async transports behind one API. | Same methods as coroutines. Cancellation works through task cancellation, the Python counterpart of `AbortSignal`. |
+| Per-call `timeout=` | Python has no `context.Context`; a per-call override replaces it for long `get_all` calls. | Optional keyword argument, default unchanged. |
+| `Client.from_env()` | Python services are usually configured through environment variables. | Explicit opt-in constructor reading `YILY_URL`, `YILY_TOKEN` and `YILY_ENVIRONMENT_ID`; nothing is read implicitly. |
+| Pydantic support in `load` | Pydantic is the most common configuration library in Python. | Optional extra (`pip install "yily-sdk[pydantic]"`): values are fetched as for dataclasses, then validated by the model. |
+| `get_many(names)` | Avoids N requests when a few values are needed without a dataclass. | One batch request, same selection rules as `load`. |
+| Optional fields (`X \| None`, defaults) | Common pattern in Python configuration. | Would differ from Go and JS, where a missing variable is always an error. Proposed only if maintainers want it for all SDKs. |
 
-The issue mentions managing secrets as well as retrieving them. To keep the first release small and consistent with the Go SDK, write operations are proposed as a **separate, optional phase**, available only with a **write-scoped** PAT:
+## 12. Testing
 
-```python
-client.set("API_KEY", "new-value")    # creates the variable or adds a new version
-client.delete("OLD_KEY")
-```
+The test suite mirrors the existing Go and JS tests so the three SDKs are checked against the same cases:
 
-These map to existing write routes (`POST /environments/{id}/variables`, `POST /variables/{id}/versions`, `DELETE /variables/{id}`) after resolving the name to an ID through the list endpoint's `search` filter. Using them with a read token raises `PermissionDeniedError` (`TOKEN_WRITE_FORBIDDEN`). Maintainers can decide whether this phase belongs in the SDK at all or stays in the CLI.
+- Configuration validation and every configuration error code.
+- Base URL and variable name normalization.
+- `get`, `get_version`, `get_all`, including the empty-environment short-circuit.
+- Batch deduplication and version conflicts.
+- Missing variables and empty values.
+- Every conversion type, including the boundary cases of the JS tests (64-bit limits, `nan`/`inf`, Go duration grammar).
+- API errors with and without an envelope, 401/404 mapping, network failures and timeouts.
+- `load` never returning a partially loaded object.
 
-## 11. Testing
+Tools: `pytest`, with [`respx`](https://lundberg.github.io/respx/) to mock `httpx` requests. Static checks use `mypy --strict` and `ruff`. The CI matrix covers every supported Python version on Linux, with one macOS and one Windows job. An integration job runs the examples against the official Yily Docker image (`deploy/docker`).
 
-- **Unit tests** with `pytest` and [`respx`](https://lundberg.github.io/respx/) to mock `httpx` requests: configuration validation, envelope parsing, error mapping for every documented code, batch splitting, version conflicts, type conversion, missing values, retries and timeouts.
-- **Async tests** run the same scenarios against `AsyncClient` through a shared parametrized test suite, ensuring both clients behave identically.
-- **Integration tests** in CI against a real Yily server started from the official Docker image (`deploy/docker`), with a read token provisioned by a setup script.
-- **Static checks**: `mypy --strict`, `ruff` (lint and format).
-- **CI matrix**: Python 3.10 to 3.13 on Linux, with one macOS and one Windows job.
+## 13. Packaging and Dependencies
 
-## 12. Packaging and Dependencies
-
-- **Python**: 3.10+ (3.9 has reached end of life).
-- **Runtime dependency**: [`httpx`](https://www.python-httpx.org/) only. It provides sync and async clients behind a single API, timeouts, HTTP/2 and good testability. The standard library offers no async HTTP client, which would force two separate implementations.
-- **Optional extra**: `pip install "yily[pydantic]"` enables Pydantic model loading. Pydantic is imported lazily, so it is never required.
+- **Python**: 3.11+ (needed for `enum.StrEnum` and `typing.Self`; 3.10 can be supported with small compatibility shims if maintainers prefer).
+- **Runtime dependency**: `httpx` only. Test and development tools are not installed by default.
+- **Distribution**: published on PyPI as `yily-sdk` (the import name is `yily`), following the `yily-sdk-js` naming.
 - **Build**: `pyproject.toml` with `hatchling`, `src/` layout, `py.typed` marker; development with `uv`.
-- **Release**: semantic versioning, changelog, PyPI publication from GitHub Actions using Trusted Publishing (no long-lived PyPI token).
-- **Compatibility**: the SDK targets `/api/v1`. Its README documents the minimum Yily server version (the one introducing the batch endpoint and PAT scopes).
+- **Release**: semantic versioning, changelog, and PyPI publication from GitHub Actions using Trusted Publishing, so no long-lived PyPI token is stored.
+- **Server compatibility**: requires a Yily server providing the batch values endpoint with per-variable versions, like the other SDKs.
 
-## 13. Usage Examples
+## 14. Usage Examples
 
-### 13.1. FastAPI
+### 14.1. Script or CI job
 
 ```python
-from contextlib import asynccontextmanager
-from fastapi import FastAPI
+import os
 import yily
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    async with yily.AsyncClient.from_env() as client:
-        app.state.config = await client.load(AppConfig)
-    yield
-
-app = FastAPI(lifespan=lifespan)
+with yily.Client(
+    base_url=os.environ["YILY_URL"],
+    environment_id=os.environ["YILY_ENVIRONMENT_ID"],
+    token=os.environ["YILY_TOKEN"],
+) as client:
+    database_url = client.get("DATABASE_URL")
 ```
 
-### 13.2. Django `settings.py`
+### 14.2. Typed configuration at startup
 
 ```python
+client = yily.Client(base_url=..., environment_id=..., token=...)
+
+try:
+    config = client.load(AppConfig)
+except yily.YilyError as error:
+    raise SystemExit(f"Cannot load configuration from Yily: {error}") from error
+finally:
+    client.close()
+```
+
+### 14.3. Django `settings.py`
+
+```python
+import os
 import yily
 
-with yily.Client.from_env() as _yily:
-    _values = _yily.get_many(["SECRET_KEY", "DATABASE_URL"])
+with yily.Client(
+    base_url=os.environ["YILY_URL"],
+    environment_id=os.environ["YILY_ENVIRONMENT_ID"],
+    token=os.environ["YILY_TOKEN"],
+) as _yily:
+    _values = _yily.get_all()
 
 SECRET_KEY = _values["SECRET_KEY"]
 DATABASE_URL = _values["DATABASE_URL"]
 ```
 
-### 13.3. Scripts and CI
+## 15. Documentation Plan
 
-```python
-import subprocess
-import yily
+The repository README follows the structure of the `yily-sdk-js` README so users switching languages find the same sections: requirements, installation, quickstart, configuration table, API reference, typed loading, error codes, security notes.
 
-with yily.Client.from_env() as client:
-    client.export_to_environ()
-
-subprocess.run(["./deploy.sh"], check=True)  # sees the variables in its environment
-```
-
-## 14. Documentation Plan
-
-The SDK repository ships a README for a quick start, plus a documentation site generated with MkDocs (Material theme) and `mkdocstrings`, which builds the API reference from docstrings and type hints. All examples in the docs are executed in CI against the mocked server, so they cannot drift from the code.
+A documentation site can be added once the API is stable (MkDocs with `mkdocstrings`, which builds the API reference from docstrings and type hints). The README examples are executed in CI so they stay correct.
 
 | Page | Content |
 |---|---|
-| Getting started | Installation, creating a **read** PAT in the Yily web interface, finding the environment ID, first `get()` call. |
-| Configuration | Every constructor option, `from_env()` and its variables, timeouts, retries, TLS and custom CA bundles. |
-| Retrieving variables | `get`, `get_many`, `get_all`, version selection, behavior for missing and empty values. |
-| Typed configuration | `load()` with dataclasses and Pydantic, `yily.Var`, `yily.Secret`, supported types, error reporting. |
-| Async usage | `AsyncClient`, sharing one client across an application, closing it properly. |
-| Error handling | The exception hierarchy, server error codes and their mapping, what is retried. |
-| Framework guides | FastAPI, Django, Flask, Celery workers. |
-| CI/CD | GitHub Actions and GitLab CI examples: storing the PAT as a CI secret, `export_to_environ()` before running a deployment. |
-| Security best practices | Read-scoped tokens, token expiry and rotation, HTTPS, never logging values, behavior after a password recovery. |
-| Migrating from `.env` files | Replacing `python-dotenv` with Yily step by step, using Yily's `.env` import to move existing variables. |
-| Changelog and compatibility | SDK versions and the minimum Yily server version each one supports. |
+| Getting started | Installation, creating a **read-scoped** PAT in the web interface, finding the environment ID, first `get()` call. |
+| Configuration | Every constructor option, validation rules, base URL normalization, timeouts, custom `httpx` client. |
+| Retrieving variables | `get`, `get_version`, `get_all`, name normalization, missing and empty values. |
+| Typed loading | Dataclasses with `yily.Var`, supported types and accepted formats, error reporting. |
+| Error handling | `YilyError`, `APIError`, the full code table, examples. |
+| Framework guides | Django, Flask, FastAPI and Celery, plus async usage if `AsyncClient` is accepted. |
+| CI/CD | Storing the PAT as a CI secret, reading values in GitHub Actions and GitLab CI jobs. |
+| Security best practices | Read-scoped tokens, expiry and rotation, HTTPS, never logging values, behavior after a password recovery. |
+| Migrating from `.env` files | Moving existing variables with Yily's `.env` import, then replacing `python-dotenv` calls. |
 
-## 15. Roadmap
+## 16. Roadmap
 
-Each phase ends with a usable, tagged release, so feedback can start early. Phases 1 to 4 cover the scope approved for the Go SDK; phase 5 depends on the maintainers' decision in [section 10](#10-managing-secrets-phase-2).
+The core comes first and must match the Go and JS SDKs before anything else is added.
 
 | Phase | Content | Release |
 |---|---|---|
-| **1. Foundation** | Repository setup (`pyproject.toml`, `src/` layout, `ruff`, `mypy --strict`, CI matrix), `Config` and validation, shared HTTP layer (envelope parsing, error mapping, no redirects), exception hierarchy. | — |
-| **2. Read operations** | Synchronous `Client`: `get`, `get_many` (batch splitting, version conflicts), `get_all`, `token_info`. Unit tests with `respx`. | `0.1.0` |
-| **3. Typed loading and async** | `load()` for dataclasses, type conversion, `yily.Var`, `yily.Secret`, `export_to_environ()`, optional Pydantic support, `AsyncClient` with the shared test suite, retries and backoff. | `0.2.0` |
-| **4. Stabilization and release** | Integration tests against the Yily Docker image, documentation site, framework examples, PyPI Trusted Publishing, API freeze. | `1.0.0` |
-| **5. Write operations (optional)** | `set` and `delete` with write-scoped PATs, if approved. | `1.1.0` |
+| **1. Foundation** | Repository setup (`pyproject.toml`, `ruff`, `mypy --strict`, CI), configuration validation, HTTP layer, envelope parsing, error classes and codes. | — |
+| **2. Core parity** | `get`, `get_version`, `get_all`, `load` for dataclasses with the full conversion grammar. Test suite mirroring the Go and JS tests. README. | `0.1.0` |
+| **3. Python additions** | Only the additions from section 11 approved by the maintainers (for example `AsyncClient`, `from_env`, Pydantic). | `0.2.0` |
+| **4. Stable release** | Integration tests against the Docker image, documentation site, PyPI Trusted Publishing, API freeze. | `1.0.0` |
 
-Out of the roadmap unless users ask for it: an in-memory cache with TTL, a CLI (Yily already ships `yily-cli`), and project, environment or tag administration.
+## 17. Open Questions
 
-## 16. Design Principles
+1. **Batches above 1,000 variables.** The server accepts at most 1,000 selections per request, and neither existing SDK splits larger batches, so `get_all` on a very large environment gets a 400 error. Should all SDKs split batches, or is this limit acceptable?
+2. **Minimum Python version**: 3.11, or 3.10 with compatibility shims?
+3. **Package name**: `yily-sdk` on PyPI, or `yily-sdk-python` to match the repository name?
+4. **Which Python-specific additions** from section 11 should be part of the first releases?
 
-- **Simplicity**: a handful of methods covering the common cases.
-- **Parity with Go**: same scope, endpoints and error semantics, so the SDKs stay consistent.
-- **Pythonic**: context managers, type hints, dataclasses, `Annotated`, exceptions instead of return codes.
-- **Minimal dependencies**: `httpx` only; Pydantic optional.
-- **Read-first and least privilege**: read-scoped tokens by default, writes only as an explicit phase 2.
-- **Safe by default**: TLS on, no logging of values, masked secrets.
+## 18. Design Principles
 
-The goal is a small, well-typed package that lets a Python application go from a Yily token to a validated configuration object in a few lines.
+- **Parity first**: same behavior, validation rules and error codes as the Go and JS SDKs.
+- **Read-only**: configuration retrieval only.
+- **Simplicity**: four methods covering every use case.
+- **Pythonic**: context managers, type hints, dataclasses, `Annotated`, exceptions.
+- **Minimal dependencies**: `httpx` only.
+- **Safe by default**: TLS verification, no redirects, no logging of values.
+
+The goal is a small, well-typed package that lets a Python application go from a Yily token to a validated configuration object in a few lines, with the same behavior as the other official SDKs.
